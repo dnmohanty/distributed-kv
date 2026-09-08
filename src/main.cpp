@@ -1,35 +1,17 @@
-#include <iostream>
-#include <thread>
-#include <vector>
-#include <string>
 #include "Store.h"
+#include "Server.h"
+#include <iostream>
 
 int main() {
-    Store kv_store(16); 
-    std::vector<std::thread> threads;
-
-    std::cout << "Firing up 100 concurrent threads...\n";
-
-    for (int i = 0; i < 50; ++i) {
-        threads.emplace_back([&kv_store, i]() {
-            for (int j = 0; j < 1000; ++j) {
-                kv_store.set("key_" + std::to_string(i) + "_" + std::to_string(j), "val");
-            }
-        });
+    try {
+        Store store(16);
+        
+        Server server(8080, store);
+        
+        server.start();
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << '\n';
+        return 1;
     }
-
-    for (int i = 0; i < 50; ++i) {
-        threads.emplace_back([&kv_store, i]() {
-            for (int j = 0; j < 1000; ++j) {
-                kv_store.get("key_" + std::to_string(i) + "_" + std::to_string(j));
-            }
-        });
-    }
-
-    for (auto& t : threads) {
-        t.join();
-    }
-
-    std::cout << "Success! 100,000 concurrent operations executed safely with no crashes.\n";
     return 0;
 }
