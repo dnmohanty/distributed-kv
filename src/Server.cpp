@@ -1,6 +1,5 @@
 #include "Server.h"
 #include <iostream>
-#include <sstream>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -8,8 +7,17 @@
 #include <sys/epoll.h>
 #include <cstring>
 #include <stdexcept>
+#include <sstream>
 
-Server::Server(int port, Store& store) : port(port), store(store) {
+Server::Server(int port, Store& store, const std::vector<std::string>& cluster_nodes) 
+    : port(port), store(store) {
+    
+    node_name = "127.0.0.1:" + std::to_string(port);
+
+    for (const auto& node : cluster_nodes) {
+        hash_ring.add_node(node);
+    }
+
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == -1) {
         throw std::runtime_error("Failed to create socket");
@@ -61,7 +69,7 @@ void Server::start() {
     const int MAX_EVENTS = 64;
     epoll_event events[MAX_EVENTS];
 
-    std::cout << "Database listening on port " << port << "...\n";
+    std::cout << "Database node " << node_name << " listening...\n";
 
     while (true) {
         int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
@@ -114,21 +122,28 @@ void Server::handle_client_data(int client_fd) {
 
     std::string response;
 
-    if (command == "SET") {
-        std::getline(iss >> std::ws, value); 
-        store.set(key, value);
-        response = "OK\n";
-    } 
-    else if (command == "GET") {
-        auto result = store.get(key);
-        if (result.has_value()) {
-            response = result.value() + "\n";
-        } else {
-            response = "(nil)\n"; 
-        }
+    std::string owner = hash_ring.get_node(key);
+
+    if (owner != node_name && !owner.empty()) {
+        response = "MOVED to " + owner + "\n";
     } 
     else {
-        response = "ERROR: Unknown command\n";
+        if (command == "SET") {
+            std::getline(iss >> std::ws, value);
+            store.set(key, value);
+            response = "OK\n";
+        } 
+        else if (command == "GET") {
+            auto result = store.get(key);
+            if (result.has_value()) {
+                response = result.value() + "\n";
+            } else {
+                response = "(nil)\n";
+            }
+        } 
+        else {
+            response = "ERROR: Unknown command\n";
+        }
     }
 
     write(client_fd, response.c_str(), response.length());
