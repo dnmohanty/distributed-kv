@@ -10,13 +10,15 @@
 #include <sstream>
 
 Server::Server(int port, Store& store, const std::vector<std::string>& cluster_nodes) 
-    : port(port), store(store) {
+    : port(port), store(store), wal("node_" + std::to_string(port) + ".wal") {
     
     node_name = "127.0.0.1:" + std::to_string(port);
 
     for (const auto& node : cluster_nodes) {
         hash_ring.add_node(node);
     }
+
+    wal.recover(store);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == -1) {
@@ -130,6 +132,7 @@ void Server::handle_client_data(int client_fd) {
     else {
         if (command == "SET") {
             std::getline(iss >> std::ws, value);
+            wal.append(key, value);
             store.set(key, value);
             response = "OK\n";
         } 
