@@ -119,8 +119,8 @@ void Server::handle_client_data(int client_fd) {
     if (!request.empty() && request.back() == '\r') request.pop_back();
 
     std::istringstream iss(request);
-    std::string command, key, value;
-    iss >> command >> key;
+    std::string command, key, value, ttl_str;
+    iss >> command >> key >> value >> ttl_str;
 
     std::string response;
 
@@ -131,10 +131,22 @@ void Server::handle_client_data(int client_fd) {
     } 
     else {
         if (command == "SET") {
-            std::getline(iss >> std::ws, value);
-            wal.append(key, value);
-            store.set(key, value);
-            response = "OK\n";
+            if (key.empty() || value.empty()) {
+                response = "ERROR: Missing key or value\n";
+            } else {
+                int ttl = 0;
+                if (!ttl_str.empty()) {
+                    try {
+                        ttl = std::stoi(ttl_str);
+                    } catch (...) {
+                        ttl = 0;
+                    }
+                }
+
+                wal.append(key, value);
+                store.set(key, value, ttl);
+                response = "OK\n";
+            }
         } 
         else if (command == "GET") {
             auto result = store.get(key);
