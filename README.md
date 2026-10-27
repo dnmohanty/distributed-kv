@@ -24,10 +24,11 @@ A sharded in-memory KV store in C++20 with a consistent-hashing proxy and a dura
     (Compactor)     (Compactor)     (Compactor)
 ```
 ## 3. Quick Start
+```bash
 git clone https://github.com/dnmohanty/distributed-kv.git
 cd distributed-kv
 docker compose up --build
-
+```
 ## 4. Command Reference
 
 Connect using `telnet 127.0.0.1 7000` or raw TCP sockets.
@@ -42,6 +43,15 @@ Connect using `telnet 127.0.0.1 7000` or raw TCP sockets.
 *    Torn-Write Protection: The WAL logs length and a CRC32 checksum before the payload, terminating recovery cleanly upon encountering a partial write caused by sudden power loss.
 *     Decoupled Disk I/O: Using --fsync=everysec shifts the blocking fdatasync() system call to an isolated background std::thread, allowing the main epoll loop to process memory queries at maximum speed.
 *     Atomic Compaction: Snapshotting locks the WAL during memory updates, preventing race conditions where acknowledged writes are dropped during background compaction.
+
+## 6. Failure Behavior
+
+| Scenario | System Reaction |
+|---|---|
+| Single Node Crash | Data in memory is wiped. Proxy routes to surviving nodes, but returns MOVED for the dead node's keys until it recovers.[cite: 7] |
+| Node Restart | Node recovers keys sequentially from its `node_<port>.wal` file, dropping expired TTLs and verifying CRC32 checksums.[cite: 7] |
+| Power Loss Mid-Write | Recovery detects a checksum mismatch on the final entry, halts recovery cleanly, and ignores the torn write.[cite: 7] |
+| Proxy Crash | Clients disconnect. Backend nodes remain operational and durable.[cite: 7] |
  
  ## 7. Guarantees and Non-Goals
  * Durability: With --fsync=always, every acknowledged write is flushed to physical storage. Crash recovery skips corrupted CRC32 records.
