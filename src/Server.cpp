@@ -13,9 +13,14 @@
 Server::Server(int port, Store& store, const std::vector<std::string>& cluster_nodes, FsyncMode fsync_mode) 
     : port(port), store(store), wal("node_" + std::to_string(port) + ".wal", fsync_mode) {
     
-    node_name = "127.0.0.1:" + std::to_string(port);
-
+    std::string port_suffix = ":" + std::to_string(port);
+    node_name = "127.0.0.1" + port_suffix; // Fallback
+    
     for (const auto& node : cluster_nodes) {
+        if (node.length() >= port_suffix.length() && 
+            node.compare(node.length() - port_suffix.length(), port_suffix.length(), port_suffix) == 0) {
+            node_name = node;
+        }
         hash_ring.add_node(node);
     }
 
@@ -69,9 +74,13 @@ void Server::set_non_blocking(int socket_fd) {
 void Server::compaction_loop() {
     while (!stop_compaction) {
         std::this_thread::sleep_for(std::chrono::seconds(10));
+        
+        store.sweep(); // Memory leak fix: Clear expired keys from RAM
+        
         struct stat st;
         if (stat(wal.get_filepath().c_str(), &st) == 0) {
             if (st.st_size > 5 * 1024 * 1024) { 
+                std::unique_lock<std::shared_mutex> lock(compaction_rwlock);
                 wal.compact(store);
             }
         }
@@ -194,6 +203,7 @@ void Server::handle_client_data(int client_fd) {
                 if (key.empty() || value.empty()) {
                     response = "ERROR: Missing key or value\n";
                 } else {
+                    std::shared_lock<std::shared_mutex> lock(compaction_rwlock);
                     wal.append(key, value, ttl);
                     store.set(key, value, ttl);
                     response = "OK\n";
@@ -209,6 +219,7 @@ void Server::handle_client_data(int client_fd) {
                 if (key.empty()) {
                     response = "ERROR: Missing key\n";
                 } else {
+                    std::shared_lock<std::shared_mutex> lock(compaction_rwlock);
                     wal.append_del(key);
                     if (store.del(key)) {
                         response = "(integer) 1\n";

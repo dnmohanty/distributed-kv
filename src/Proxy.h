@@ -5,6 +5,7 @@
 #include <queue>
 #include <thread>
 #include <atomic>
+#include <shared_mutex>
 #include "ConsistentHash.h"
 
 class Proxy {
@@ -13,6 +14,7 @@ private:
     int epoll_fd;
     int port;
 
+    std::shared_mutex state_mtx;
     ConsistentHash hash_ring;
     std::vector<std::string> nodes;
 

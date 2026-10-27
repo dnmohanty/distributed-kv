@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <thread>
 #include <atomic>
+#include <shared_mutex>
 #include "Store.h"
 #include "ConsistentHash.h"
 #include "WAL.h"
@@ -23,6 +24,7 @@ private:
 
     std::thread compaction_thread;
     std::atomic<bool> stop_compaction;
+    std::shared_mutex compaction_rwlock; // Prevents race condition during snapshots
 
     void set_non_blocking(int socket_fd);
     void handle_new_connection();

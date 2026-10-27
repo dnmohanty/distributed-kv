@@ -64,3 +64,19 @@ std::vector<std::tuple<std::string, std::string, uint64_t>> Store::get_snapshot(
     }
     return snapshot;
 }
+
+void Store::sweep() {
+    uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    
+    for (size_t i = 0; i < num_shards; ++i) {
+        std::unique_lock<std::shared_mutex> lock(shards[i].mutex);
+        for (auto it = shards[i].data.begin(); it != shards[i].data.end(); ) {
+            if (it->second.expiry_time > 0 && it->second.expiry_time <= now) {
+                it = shards[i].data.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}

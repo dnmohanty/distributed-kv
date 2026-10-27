@@ -11,6 +11,7 @@
 #include <sstream>
 #include <thread>
 #include <chrono>
+#include <netdb.h>
 
 Proxy::Proxy(int port, const std::vector<std::string>& cluster_nodes) : port(port), nodes(cluster_nodes), stop_health_checks(false) {
     for (const auto& node : cluster_nodes) {
@@ -43,7 +44,6 @@ Proxy::Proxy(int port, const std::vector<std::string>& cluster_nodes) : port(por
     }
 
     set_non_blocking(proxy_fd);
-
     health_check_thread = std::thread(&Proxy::health_check_loop, this);
 }
 
@@ -73,41 +73,61 @@ void Proxy::connect_to_node(const std::string& node) {
     size_t colon_pos = node.find(':');
     if (colon_pos == std::string::npos) return;
 
-    std::string ip = node.substr(0, colon_pos);
-    int target_port = std::stoi(node.substr(colon_pos + 1));
+    std::string host = node.substr(0, colon_pos);
+    std::string port_str = node.substr(colon_pos + 1);
 
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return;
+    struct addrinfo hints{}, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
 
-    sockaddr_in serv_addr{};
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(target_port);
-    inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr);
+    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0) return;
 
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == 0 || errno == EINPROGRESS) {
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) {
+        freeaddrinfo(res);
+        return;
+    }
+
+    if (connect(sock, res->ai_addr, res->ai_addrlen) == 0 || errno == EINPROGRESS) {
         set_non_blocking(sock);
         epoll_event event{};
         event.events = EPOLLIN | EPOLLET;
         event.data.fd = sock;
         epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &event);
+        
+        std::unique_lock<std::shared_mutex> lock(state_mtx);
         node_to_fd[node] = sock;
     } else {
         close(sock);
     }
+    freeaddrinfo(res);
 }
 
 void Proxy::health_check_loop() {
     while (!stop_health_checks) {
         std::this_thread::sleep_for(std::chrono::seconds(5));
         for (const auto& node : nodes) {
-            if (node_to_fd.find(node) == node_to_fd.end()) continue;
+            int fd = -1;
+            {
+                std::shared_lock<std::shared_mutex> lock(state_mtx);
+                if (node_to_fd.find(node) != node_to_fd.end()) {
+                    fd = node_to_fd[node];
+                }
+            }
             
-            int fd = node_to_fd[node];
-            char buf[1];
-            ssize_t res = recv(fd, buf, 1, MSG_PEEK | MSG_DONTWAIT);
+            bool is_healthy = false;
+            if (fd != -1) {
+                char buf[1];
+                ssize_t res = recv(fd, buf, 1, MSG_PEEK | MSG_DONTWAIT);
+                is_healthy = !(res == 0 || (res == -1 && errno != EAGAIN && errno != EWOULDBLOCK));
+            } else {
+                connect_to_node(node);
+                std::shared_lock<std::shared_mutex> lock(state_mtx);
+                is_healthy = (node_to_fd.find(node) != node_to_fd.end());
+            }
             
-            bool is_healthy = !(res == 0 || (res == -1 && errno != EAGAIN && errno != EWOULDBLOCK));
-            
+            std::unique_lock<std::shared_mutex> lock(state_mtx);
             if (is_healthy != node_status[node]) {
                 node_status[node] = is_healthy;
                 if (is_healthy) {
@@ -116,9 +136,10 @@ void Proxy::health_check_loop() {
                 } else {
                     std::cout << "[Proxy] Node " << node << " DOWN. Evicting from ring.\n";
                     hash_ring.remove_node(node);
-                    close(fd);
-                    node_to_fd.erase(node);
-                    connect_to_node(node);
+                    if (fd != -1) {
+                        close(fd);
+                        node_to_fd.erase(node);
+                    }
                 }
             }
         }
@@ -144,10 +165,10 @@ void Proxy::start() {
                 handle_new_connection();
             } else {
                 bool is_backend = false;
-                for (auto const& [node, fd] : node_to_fd) {
-                    if (fd == current_fd) {
-                        is_backend = true;
-                        break;
+                {
+                    std::shared_lock<std::shared_mutex> lock(state_mtx);
+                    for (auto const& [node, fd] : node_to_fd) {
+                        if (fd == current_fd) { is_backend = true; break; }
                     }
                 }
                 
@@ -227,12 +248,20 @@ void Proxy::handle_client_data(int client_fd) {
             std::string err = "ERROR: Missing key\n";
             write(client_fd, err.c_str(), err.length());
         } else {
-            std::string owner = hash_ring.get_node(key);
-            if (owner.empty() || node_to_fd.find(owner) == node_to_fd.end()) {
+            std::string owner;
+            int backend_fd = -1;
+            {
+                std::shared_lock<std::shared_mutex> lock(state_mtx);
+                owner = hash_ring.get_node(key);
+                if (!owner.empty() && node_to_fd.find(owner) != node_to_fd.end()) {
+                    backend_fd = node_to_fd[owner];
+                }
+            }
+
+            if (backend_fd == -1) {
                 std::string err = "ERROR: No backend nodes available\n";
                 write(client_fd, err.c_str(), err.length());
             } else {
-                int backend_fd = node_to_fd[owner];
                 backend_pending_clients[backend_fd].push(client_fd);
                 write(backend_fd, full_request.c_str(), full_request.length());
             }

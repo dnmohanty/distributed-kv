@@ -32,6 +32,6 @@ public:
     std::optional<std::string> get(const std::string& key);
     bool del(const std::string& key);
     
-    // New method for WAL Compaction
     std::vector<std::tuple<std::string, std::string, uint64_t>> get_snapshot();
+    void sweep(); 
 };

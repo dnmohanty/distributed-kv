@@ -8,22 +8,15 @@
 
 WAL::WAL(const std::string& filepath, FsyncMode mode) : filepath(filepath), fsync_mode(mode), stop_thread(false) {
     fd = open(filepath.c_str(), O_CREAT | O_RDWR | O_APPEND, 0644);
-    if (fd < 0) {
-        throw std::runtime_error("Failed to open WAL file: " + filepath);
-    }
-
-    if (fsync_mode == FsyncMode::EVERYSEC) {
-        flush_thread = std::thread(&WAL::background_flush, this);
-    }
+    if (fd < 0) throw std::runtime_error("Failed to open WAL file: " + filepath);
+    if (fsync_mode == FsyncMode::EVERYSEC) flush_thread = std::thread(&WAL::background_flush, this);
 }
 
 WAL::~WAL() {
     if (fsync_mode == FsyncMode::EVERYSEC) {
         stop_thread = true;
         cv.notify_one();
-        if (flush_thread.joinable()) {
-            flush_thread.join();
-        }
+        if (flush_thread.joinable()) flush_thread.join();
     }
     if (fd >= 0) {
         fdatasync(fd);
@@ -47,9 +40,7 @@ uint32_t WAL::calculate_crc32(const std::string& data) {
     uint32_t crc = 0xFFFFFFFF;
     for (char c : data) {
         crc ^= static_cast<uint8_t>(c);
-        for (int j = 0; j < 8; ++j) {
-            crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
-        }
+        for (int j = 0; j < 8; ++j) crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
     }
     return ~crc;
 }
@@ -70,10 +61,7 @@ void WAL::append(const std::string& key, const std::string& value, int ttl) {
     write(fd, &len, sizeof(len));
     write(fd, &crc, sizeof(crc));
     write(fd, payload.c_str(), len);
-    
-    if (fsync_mode == FsyncMode::ALWAYS) {
-        fdatasync(fd);
-    }
+    if (fsync_mode == FsyncMode::ALWAYS) fdatasync(fd);
 }
 
 void WAL::append_del(const std::string& key) {
@@ -85,10 +73,7 @@ void WAL::append_del(const std::string& key) {
     write(fd, &len, sizeof(len));
     write(fd, &crc, sizeof(crc));
     write(fd, payload.c_str(), len);
-    
-    if (fsync_mode == FsyncMode::ALWAYS) {
-        fdatasync(fd);
-    }
+    if (fsync_mode == FsyncMode::ALWAYS) fdatasync(fd);
 }
 
 void WAL::recover(Store& store) {
@@ -102,7 +87,8 @@ void WAL::recover(Store& store) {
         
         ssize_t rb = read(fd, &len, sizeof(len));
         if (rb <= 0) break;
-        if (rb != sizeof(len)) { ftruncate(fd, record_start); break; }
+        // Cap untrusted length header to 10MB to prevent bad alloc crash
+        if (rb != sizeof(len) || len > 10 * 1024 * 1024) { ftruncate(fd, record_start); break; }
 
         rb = read(fd, &crc, sizeof(crc));
         if (rb != sizeof(crc)) { ftruncate(fd, record_start); break; }
@@ -138,9 +124,7 @@ void WAL::recover(Store& store) {
         }
     }
     
-    if (recovered_count > 0) {
-        std::cout << "Recovered " << recovered_count << " keys from disk.\n";
-    }
+    if (recovered_count > 0) std::cout << "Recovered " << recovered_count << " keys from disk.\n";
 }
 
 void WAL::compact(Store& store) {
@@ -164,7 +148,6 @@ void WAL::compact(Store& store) {
     
     fdatasync(tmp_fd);
     close(tmp_fd);
-
     rename(tmp_filepath.c_str(), filepath.c_str());
     
     close(fd);
