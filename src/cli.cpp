@@ -6,7 +6,6 @@
 #include <cstring>
 
 int main(int argc, char* argv[]) {
-    // Default to proxy port 7000 unless specified
     int port = 7000;
     if (argc > 1) {
         port = std::stoi(argv[1]);
@@ -56,7 +55,7 @@ int main(int argc, char* argv[]) {
         int bytes_read = read(sock, buffer, sizeof(buffer) - 1);
         
         if (bytes_read > 0) {
-            std::cout << buffer; // The response already has a newline from the server
+            std::cout << buffer; 
         } else {
             std::cout << "Connection closed by server.\n";
             break;

@@ -3,16 +3,15 @@
 #include <map>
 #include <vector>
 #include <shared_mutex>
+#include <cstdint>
 
 class ConsistentHash {
 private:
-    std::map<size_t, std::string> ring;
-    
+    std::map<uint32_t, std::string> ring;
     int virtual_nodes; 
-    
-    std::shared_mutex mutex;
+    mutable std::shared_mutex mutex;
 
-    size_t hash_key(const std::string& key);
+    uint32_t fnv1a_hash(const std::string& key) const;
 
 public:
     ConsistentHash(int virtual_nodes = 100);

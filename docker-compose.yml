@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  node1:
+    build: .
+    command: ["./kv_server", "8080", "node1:8080", "node2:8081", "node3:8082", "--fsync=everysec"]
+    ports:
+      - "8080:8080"
+
+  node2:
+    build: .
+    command: ["./kv_server", "8081", "node1:8080", "node2:8081", "node3:8082", "--fsync=everysec"]
+    ports:
+      - "8081:8081"
+
+  node3:
+    build: .
+    command: ["./kv_server", "8082", "node1:8080", "node2:8081", "node3:8082", "--fsync=everysec"]
+    ports:
+      - "8082:8082"
+
+  proxy:
+    build: .
+    command: ["./kv_server", "proxy", "7000", "node1:8080", "node2:8081", "node3:8082"]
+    ports:
+      - "7000:7000"
+    depends_on:
+      - node1
+      - node2
+      - node3

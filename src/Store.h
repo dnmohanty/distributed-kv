@@ -1,31 +1,37 @@
 #pragma once
 #include <string>
 #include <unordered_map>
-#include <shared_mutex>
 #include <vector>
+#include <tuple>
+#include <shared_mutex>
 #include <optional>
 #include <chrono>
 
-struct CacheEntry {
+struct Record {
     std::string value;
     uint64_t expiry_time; 
 };
 
+struct Shard {
+    std::unordered_map<std::string, Record> data;
+    mutable std::shared_mutex mutex;
+};
+
 class Store {
 private:
-    struct Shard {
-        std::unordered_map<std::string, CacheEntry> data;
-        mutable std::shared_mutex mutex; 
-    };
-
     size_t num_shards;
     std::vector<Shard> shards;
 
     size_t getShardIndex(const std::string& key) const;
 
 public:
-    explicit Store(size_t num_shards = 16);
+    Store(size_t num_shards = 16);
     
     void set(const std::string& key, const std::string& value, int ttl = 0);
-    std::optional<std::string> get(const std::string& key); 
+    void set_with_absolute_expiry(const std::string& key, const std::string& value, uint64_t expiry);
+    std::optional<std::string> get(const std::string& key);
+    bool del(const std::string& key);
+    
+    // New method for WAL Compaction
+    std::vector<std::tuple<std::string, std::string, uint64_t>> get_snapshot();
 };

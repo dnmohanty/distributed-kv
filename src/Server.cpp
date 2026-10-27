@@ -5,12 +5,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 #include <cstring>
 #include <stdexcept>
 #include <sstream>
 
-Server::Server(int port, Store& store, const std::vector<std::string>& cluster_nodes) 
-    : port(port), store(store), wal("node_" + std::to_string(port) + ".wal") {
+Server::Server(int port, Store& store, const std::vector<std::string>& cluster_nodes, FsyncMode fsync_mode) 
+    : port(port), store(store), wal("node_" + std::to_string(port) + ".wal", fsync_mode) {
     
     node_name = "127.0.0.1:" + std::to_string(port);
 
@@ -47,9 +48,15 @@ Server::Server(int port, Store& store, const std::vector<std::string>& cluster_n
     if (epoll_fd == -1) {
         throw std::runtime_error("Failed to create epoll");
     }
+
+    stop_compaction = false;
+    compaction_thread = std::thread(&Server::compaction_loop, this);
 }
 
 Server::~Server() {
+    stop_compaction = true;
+    if (compaction_thread.joinable()) compaction_thread.join();
+
     close(server_fd);
     close(epoll_fd);
 }
@@ -57,6 +64,18 @@ Server::~Server() {
 void Server::set_non_blocking(int socket_fd) {
     int flags = fcntl(socket_fd, F_GETFL, 0);
     fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+void Server::compaction_loop() {
+    while (!stop_compaction) {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        struct stat st;
+        if (stat(wal.get_filepath().c_str(), &st) == 0) {
+            if (st.st_size > 5 * 1024 * 1024) { 
+                wal.compact(store);
+            }
+        }
+    }
 }
 
 void Server::start() {
@@ -87,79 +106,120 @@ void Server::start() {
 }
 
 void Server::handle_new_connection() {
-    sockaddr_in client_addr{};
-    socklen_t client_len = sizeof(client_addr);
-    
-    int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-    if (client_fd == -1) return;
+    while (true) {
+        sockaddr_in client_addr{};
+        socklen_t client_len = sizeof(client_addr);
+        
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            return;
+        }
 
-    set_non_blocking(client_fd);
+        set_non_blocking(client_fd);
 
-    epoll_event event{};
-    event.events = EPOLLIN | EPOLLET; 
-    event.data.fd = client_fd;
+        epoll_event event{};
+        event.events = EPOLLIN | EPOLLET; 
+        event.data.fd = client_fd;
 
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event);
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event);
+    }
 }
 
 void Server::handle_client_data(int client_fd) {
     char buffer[1024];
-    ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
-
-    if (bytes_read <= 0) {
-        close(client_fd);
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
-        return;
-    } 
-    
-    buffer[bytes_read] = '\0';
-    std::string request(buffer);
-    
-    if (!request.empty() && request.back() == '\n') request.pop_back();
-    if (!request.empty() && request.back() == '\r') request.pop_back();
-
-    std::istringstream iss(request);
-    std::string command, key, value, ttl_str;
-    iss >> command >> key >> value >> ttl_str;
-
-    std::string response;
-
-    std::string owner = hash_ring.get_node(key);
-
-    if (owner != node_name && !owner.empty()) {
-        response = "MOVED to " + owner + "\n";
-    } 
-    else {
-        if (command == "SET") {
-            if (key.empty() || value.empty()) {
-                response = "ERROR: Missing key or value\n";
-            } else {
-                int ttl = 0;
-                if (!ttl_str.empty()) {
-                    try {
-                        ttl = std::stoi(ttl_str);
-                    } catch (...) {
-                        ttl = 0;
-                    }
-                }
-
-                wal.append(key, value);
-                store.set(key, value, ttl);
-                response = "OK\n";
-            }
-        } 
-        else if (command == "GET") {
-            auto result = store.get(key);
-            if (result.has_value()) {
-                response = result.value() + "\n";
-            } else {
-                response = "(nil)\n";
-            }
-        } 
-        else {
-            response = "ERROR: Unknown command\n";
+    while (true) {
+        ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
+        if (bytes_read > 0) {
+            client_buffers[client_fd].append(buffer, bytes_read);
+        } else if (bytes_read == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            close(client_fd);
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+            client_buffers.erase(client_fd);
+            return;
+        } else {
+            close(client_fd);
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+            client_buffers.erase(client_fd);
+            return;
         }
     }
 
-    write(client_fd, response.c_str(), response.length());
+    auto& buf = client_buffers[client_fd];
+    size_t pos;
+    while ((pos = buf.find('\n')) != std::string::npos) {
+        std::string request = buf.substr(0, pos);
+        buf.erase(0, pos + 1);
+
+        if (!request.empty() && request.back() == '\r') request.pop_back();
+        if (request.empty()) continue;
+
+        std::string command, key, value;
+        int ttl = 0;
+
+        size_t first_space = request.find(' ');
+        if (first_space != std::string::npos) {
+            command = request.substr(0, first_space);
+            size_t second_space = request.find(' ', first_space + 1);
+            if (second_space != std::string::npos) {
+                key = request.substr(first_space + 1, second_space - first_space - 1);
+                std::string remainder = request.substr(second_space + 1);
+                
+                size_t ex_pos = remainder.rfind(" EX ");
+                if (ex_pos != std::string::npos) {
+                    value = remainder.substr(0, ex_pos);
+                    try {
+                        ttl = std::stoi(remainder.substr(ex_pos + 4));
+                    } catch (...) {
+                        ttl = 0;
+                    }
+                } else {
+                    value = remainder;
+                }
+            } else {
+                key = request.substr(first_space + 1);
+            }
+        } else {
+            command = request;
+        }
+
+        std::string response;
+        std::string owner = hash_ring.get_node(key);
+
+        if (owner != node_name && !owner.empty()) {
+            response = "MOVED to " + owner + "\n";
+        } else {
+            if (command == "SET") {
+                if (key.empty() || value.empty()) {
+                    response = "ERROR: Missing key or value\n";
+                } else {
+                    wal.append(key, value, ttl);
+                    store.set(key, value, ttl);
+                    response = "OK\n";
+                }
+            } else if (command == "GET") {
+                auto result = store.get(key);
+                if (result.has_value()) {
+                    response = result.value() + "\n";
+                } else {
+                    response = "(nil)\n";
+                }
+            } else if (command == "DEL") {
+                if (key.empty()) {
+                    response = "ERROR: Missing key\n";
+                } else {
+                    wal.append_del(key);
+                    if (store.del(key)) {
+                        response = "(integer) 1\n";
+                    } else {
+                        response = "(integer) 0\n";
+                    }
+                }
+            } else {
+                response = "ERROR: Unknown command\n";
+            }
+        }
+        write(client_fd, response.c_str(), response.length());
+    }
 }
