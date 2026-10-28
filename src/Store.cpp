@@ -8,17 +8,7 @@ size_t Store::getShardIndex(const std::string& key) const {
     return std::hash<std::string>{}(key) % num_shards;
 }
 
-void Store::set(const std::string& key, const std::string& value, int ttl) {
-    uint64_t expiry = 0;
-    if (ttl > 0) {
-        uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
-        expiry = now + ttl;
-    }
-    set_with_absolute_expiry(key, value, expiry);
-}
-
-void Store::set_with_absolute_expiry(const std::string& key, const std::string& value, uint64_t expiry) {
+void Store::set(const std::string& key, const std::string& value, uint64_t expiry) {
     size_t index = getShardIndex(key);
     std::unique_lock<std::shared_mutex> lock(shards[index].mutex);
     shards[index].data[key] = {value, expiry};

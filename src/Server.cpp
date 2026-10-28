@@ -14,7 +14,7 @@ Server::Server(int port, Store& store, const std::vector<std::string>& cluster_n
     : port(port), store(store), wal("node_" + std::to_string(port) + ".wal", fsync_mode) {
     
     std::string port_suffix = ":" + std::to_string(port);
-    node_name = "127.0.0.1" + port_suffix; // Fallback
+    node_name = "127.0.0.1" + port_suffix;
     
     for (const auto& node : cluster_nodes) {
         if (node.length() >= port_suffix.length() && 
@@ -27,9 +27,7 @@ Server::Server(int port, Store& store, const std::vector<std::string>& cluster_n
     wal.recover(store);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
-        throw std::runtime_error("Failed to create socket");
-    }
+    if (server_fd == -1) throw std::runtime_error("Failed to create socket");
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -40,19 +38,15 @@ Server::Server(int port, Store& store, const std::vector<std::string>& cluster_n
     address.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        throw std::runtime_error("Failed to bind to port");
+        throw std::runtime_error("Failed to bind");
     }
 
-    if (listen(server_fd, SOMAXCONN) < 0) {
-        throw std::runtime_error("Failed to listen on socket");
-    }
+    if (listen(server_fd, SOMAXCONN) < 0) throw std::runtime_error("Failed to listen");
 
     set_non_blocking(server_fd);
 
     epoll_fd = epoll_create1(0);
-    if (epoll_fd == -1) {
-        throw std::runtime_error("Failed to create epoll");
-    }
+    if (epoll_fd == -1) throw std::runtime_error("Failed to create epoll");
 
     stop_compaction = false;
     compaction_thread = std::thread(&Server::compaction_loop, this);
@@ -61,7 +55,6 @@ Server::Server(int port, Store& store, const std::vector<std::string>& cluster_n
 Server::~Server() {
     stop_compaction = true;
     if (compaction_thread.joinable()) compaction_thread.join();
-
     close(server_fd);
     close(epoll_fd);
 }
@@ -74,9 +67,7 @@ void Server::set_non_blocking(int socket_fd) {
 void Server::compaction_loop() {
     while (!stop_compaction) {
         std::this_thread::sleep_for(std::chrono::seconds(10));
-        
-        store.sweep(); // Memory leak fix: Clear expired keys from RAM
-        
+        store.sweep();
         struct stat st;
         if (stat(wal.get_filepath().c_str(), &st) == 0) {
             if (st.st_size > 5 * 1024 * 1024) { 
@@ -91,19 +82,13 @@ void Server::start() {
     epoll_event event{};
     event.events = EPOLLIN;
     event.data.fd = server_fd;
-
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) == -1) {
-        throw std::runtime_error("Failed to add server socket to epoll");
-    }
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) == -1) throw std::runtime_error("Failed epoll_ctl");
 
     const int MAX_EVENTS = 64;
     epoll_event events[MAX_EVENTS];
 
-    std::cout << "Database node " << node_name << " listening...\n";
-
     while (true) {
         int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
-        
         for (int i = 0; i < num_events; ++i) {
             if (events[i].data.fd == server_fd) {
                 handle_new_connection();
@@ -118,19 +103,15 @@ void Server::handle_new_connection() {
     while (true) {
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
-        
         int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             return;
         }
-
         set_non_blocking(client_fd);
-
         epoll_event event{};
         event.events = EPOLLIN | EPOLLET; 
         event.data.fd = client_fd;
-
         epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event);
     }
 }
@@ -141,6 +122,12 @@ void Server::handle_client_data(int client_fd) {
         ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
         if (bytes_read > 0) {
             client_buffers[client_fd].append(buffer, bytes_read);
+            if (client_buffers[client_fd].size() > 1048576) {
+                close(client_fd);
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                client_buffers.erase(client_fd);
+                return;
+            }
         } else if (bytes_read == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             close(client_fd);
@@ -165,7 +152,8 @@ void Server::handle_client_data(int client_fd) {
         if (request.empty()) continue;
 
         std::string command, key, value;
-        int ttl = 0;
+        int64_t ttl_val = 0;
+        bool valid_ttl = true;
 
         size_t first_space = request.find(' ');
         if (first_space != std::string::npos) {
@@ -179,9 +167,10 @@ void Server::handle_client_data(int client_fd) {
                 if (ex_pos != std::string::npos) {
                     value = remainder.substr(0, ex_pos);
                     try {
-                        ttl = std::stoi(remainder.substr(ex_pos + 4));
+                        ttl_val = std::stoll(remainder.substr(ex_pos + 4));
+                        if (ttl_val <= 0) valid_ttl = false;
                     } catch (...) {
-                        ttl = 0;
+                        valid_ttl = false;
                     }
                 } else {
                     value = remainder;
@@ -202,11 +191,21 @@ void Server::handle_client_data(int client_fd) {
             if (command == "SET") {
                 if (key.empty() || value.empty()) {
                     response = "ERROR: Missing key or value\n";
+                } else if (!valid_ttl) {
+                    response = "ERROR: Invalid TTL\n";
                 } else {
+                    uint64_t expiry = 0;
+                    if (ttl_val > 0) {
+                        expiry = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count()) + ttl_val;
+                    }
                     std::shared_lock<std::shared_mutex> lock(compaction_rwlock);
-                    wal.append(key, value, ttl);
-                    store.set(key, value, ttl);
-                    response = "OK\n";
+                    if (wal.append(key, value, expiry)) {
+                        store.set(key, value, expiry);
+                        response = "OK\n";
+                    } else {
+                        response = "ERROR: Disk write failed\n";
+                    }
                 }
             } else if (command == "GET") {
                 auto result = store.get(key);
@@ -220,17 +219,20 @@ void Server::handle_client_data(int client_fd) {
                     response = "ERROR: Missing key\n";
                 } else {
                     std::shared_lock<std::shared_mutex> lock(compaction_rwlock);
-                    wal.append_del(key);
-                    if (store.del(key)) {
-                        response = "(integer) 1\n";
+                    if (wal.append_del(key)) {
+                        if (store.del(key)) {
+                            response = "(integer) 1\n";
+                        } else {
+                            response = "(integer) 0\n";
+                        }
                     } else {
-                        response = "(integer) 0\n";
+                        response = "ERROR: Disk write failed\n";
                     }
                 }
             } else {
                 response = "ERROR: Unknown command\n";
             }
         }
-        write(client_fd, response.c_str(), response.length());
+        send(client_fd, response.c_str(), response.length(), MSG_NOSIGNAL);
     }
 }

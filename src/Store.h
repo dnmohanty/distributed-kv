@@ -27,8 +27,7 @@ private:
 public:
     Store(size_t num_shards = 16);
     
-    void set(const std::string& key, const std::string& value, int ttl = 0);
-    void set_with_absolute_expiry(const std::string& key, const std::string& value, uint64_t expiry);
+    void set(const std::string& key, const std::string& value, uint64_t expiry = 0);
     std::optional<std::string> get(const std::string& key);
     bool del(const std::string& key);
     

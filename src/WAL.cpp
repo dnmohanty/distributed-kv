@@ -1,14 +1,14 @@
 #include "WAL.h"
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
 #include <fcntl.h>
 #include <unistd.h>
 #include <chrono>
+#include <cstring>
 
 WAL::WAL(const std::string& filepath, FsyncMode mode) : filepath(filepath), fsync_mode(mode), stop_thread(false) {
     fd = open(filepath.c_str(), O_CREAT | O_RDWR | O_APPEND, 0644);
-    if (fd < 0) throw std::runtime_error("Failed to open WAL file: " + filepath);
+    if (fd < 0) throw std::runtime_error("Failed to open WAL");
     if (fsync_mode == FsyncMode::EVERYSEC) flush_thread = std::thread(&WAL::background_flush, this);
 }
 
@@ -19,7 +19,11 @@ WAL::~WAL() {
         if (flush_thread.joinable()) flush_thread.join();
     }
     if (fd >= 0) {
-        fdatasync(fd);
+        if (fsync_mode != FsyncMode::NEVER) {
+            if (fdatasync(fd) < 0) {
+                std::cerr << "[WAL] Sync failed on shutdown\n";
+            }
+        }
         close(fd);
     }
 }
@@ -31,7 +35,9 @@ void WAL::background_flush() {
         cv.wait_for(lk, std::chrono::seconds(1));
         if (fd >= 0) {
             std::lock_guard<std::mutex> lock(mtx);
-            fdatasync(fd);
+            if (fdatasync(fd) < 0) {
+                std::cerr << "[WAL] Background sync failed\n";
+            }
         }
     }
 }
@@ -45,35 +51,66 @@ uint32_t WAL::calculate_crc32(const std::string& data) {
     return ~crc;
 }
 
-void WAL::append(const std::string& key, const std::string& value, int ttl) {
-    uint64_t expiry = 0;
-    if (ttl > 0) {
-        uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
-        expiry = now + ttl;
+bool WAL::write_fully(int file_fd, const void* buf, size_t count) {
+    const char* p = static_cast<const char*>(buf);
+    size_t total = 0;
+    while (total < count) {
+        ssize_t written = write(file_fd, p + total, count - total);
+        if (written <= 0) return false;
+        total += written;
     }
-
-    std::string payload = "SET " + key + " " + std::to_string(expiry) + " " + value;
-    uint32_t len = payload.size();
-    uint32_t crc = calculate_crc32(payload);
-
-    std::lock_guard<std::mutex> lock(mtx);
-    write(fd, &len, sizeof(len));
-    write(fd, &crc, sizeof(crc));
-    write(fd, payload.c_str(), len);
-    if (fsync_mode == FsyncMode::ALWAYS) fdatasync(fd);
+    return true;
 }
 
-void WAL::append_del(const std::string& key) {
-    std::string payload = "DEL " + key;
+bool WAL::append(const std::string& key, const std::string& value, uint64_t expiry) {
+    std::string payload;
+    uint8_t op = 0;
+    payload.append(reinterpret_cast<const char*>(&op), 1);
+    
+    uint32_t klen = key.size();
+    payload.append(reinterpret_cast<const char*>(&klen), 4);
+    payload.append(key);
+    
+    payload.append(reinterpret_cast<const char*>(&expiry), 8);
+    uint32_t vlen = value.size();
+    payload.append(reinterpret_cast<const char*>(&vlen), 4);
+    payload.append(value);
+
     uint32_t len = payload.size();
     uint32_t crc = calculate_crc32(payload);
 
     std::lock_guard<std::mutex> lock(mtx);
-    write(fd, &len, sizeof(len));
-    write(fd, &crc, sizeof(crc));
-    write(fd, payload.c_str(), len);
-    if (fsync_mode == FsyncMode::ALWAYS) fdatasync(fd);
+    if (!write_fully(fd, &len, sizeof(len))) return false;
+    if (!write_fully(fd, &crc, sizeof(crc))) return false;
+    if (!write_fully(fd, payload.c_str(), len)) return false;
+    
+    if (fsync_mode == FsyncMode::ALWAYS) {
+        if (fdatasync(fd) < 0) return false;
+    }
+    return true;
+}
+
+bool WAL::append_del(const std::string& key) {
+    std::string payload;
+    uint8_t op = 1;
+    payload.append(reinterpret_cast<const char*>(&op), 1);
+    
+    uint32_t klen = key.size();
+    payload.append(reinterpret_cast<const char*>(&klen), 4);
+    payload.append(key);
+
+    uint32_t len = payload.size();
+    uint32_t crc = calculate_crc32(payload);
+
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!write_fully(fd, &len, sizeof(len))) return false;
+    if (!write_fully(fd, &crc, sizeof(crc))) return false;
+    if (!write_fully(fd, payload.c_str(), len)) return false;
+    
+    if (fsync_mode == FsyncMode::ALWAYS) {
+        if (fdatasync(fd) < 0) return false;
+    }
+    return true;
 }
 
 void WAL::recover(Store& store) {
@@ -87,44 +124,54 @@ void WAL::recover(Store& store) {
         
         ssize_t rb = read(fd, &len, sizeof(len));
         if (rb <= 0) break;
-        // Cap untrusted length header to 10MB to prevent bad alloc crash
-        if (rb != sizeof(len) || len > 10 * 1024 * 1024) { ftruncate(fd, record_start); break; }
+        if (rb != sizeof(len) || len > 10 * 1024 * 1024) { 
+            if (ftruncate(fd, record_start) < 0) std::cerr << "[WAL] Failed to truncate log\n"; 
+            break; 
+        }
 
         rb = read(fd, &crc, sizeof(crc));
-        if (rb != sizeof(crc)) { ftruncate(fd, record_start); break; }
+        if (rb != sizeof(crc)) { 
+            if (ftruncate(fd, record_start) < 0) std::cerr << "[WAL] Failed to truncate log\n"; 
+            break; 
+        }
 
         std::string payload(len, '\0');
         rb = read(fd, &payload[0], len);
-        if (rb != len) { ftruncate(fd, record_start); break; }
+        if (rb != len) { 
+            if (ftruncate(fd, record_start) < 0) std::cerr << "[WAL] Failed to truncate log\n"; 
+            break; 
+        }
 
         if (calculate_crc32(payload) != crc) {
-            ftruncate(fd, record_start);
+            if (ftruncate(fd, record_start) < 0) std::cerr << "[WAL] Failed to truncate log\n";
             break;
         }
 
-        std::istringstream iss(payload);
-        std::string command, key;
-        iss >> command >> key;
+        uint8_t op = payload[0];
+        size_t offset = 1;
+        uint32_t klen = *reinterpret_cast<const uint32_t*>(payload.data() + offset);
+        offset += 4;
+        std::string key = payload.substr(offset, klen);
+        offset += klen;
 
-        if (command == "SET") {
-            uint64_t expiry = 0;
-            iss >> expiry;
-            std::string value;
-            std::getline(iss >> std::ws, value);
+        if (op == 0) {
+            uint64_t expiry = *reinterpret_cast<const uint64_t*>(payload.data() + offset);
+            offset += 8;
+            uint32_t vlen = *reinterpret_cast<const uint32_t*>(payload.data() + offset);
+            offset += 4;
+            std::string value = payload.substr(offset, vlen);
             
             uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
             
             if (expiry == 0 || expiry > now) {
-                store.set_with_absolute_expiry(key, value, expiry);
+                store.set(key, value, expiry);
                 recovered_count++;
             }
-        } else if (command == "DEL") {
+        } else if (op == 1) {
             store.del(key);
         }
     }
-    
-    if (recovered_count > 0) std::cout << "Recovered " << recovered_count << " keys from disk.\n";
 }
 
 void WAL::compact(Store& store) {
@@ -137,20 +184,38 @@ void WAL::compact(Store& store) {
     auto snapshot = store.get_snapshot();
     
     for (const auto& [key, value, expiry] : snapshot) {
-        std::string payload = "SET " + key + " " + std::to_string(expiry) + " " + value;
+        std::string payload;
+        uint8_t op = 0;
+        payload.append(reinterpret_cast<const char*>(&op), 1);
+        uint32_t klen = key.size();
+        payload.append(reinterpret_cast<const char*>(&klen), 4);
+        payload.append(key);
+        payload.append(reinterpret_cast<const char*>(&expiry), 8);
+        uint32_t vlen = value.size();
+        payload.append(reinterpret_cast<const char*>(&vlen), 4);
+        payload.append(value);
+
         uint32_t len = payload.size();
         uint32_t crc = calculate_crc32(payload);
 
-        write(tmp_fd, &len, sizeof(len));
-        write(tmp_fd, &crc, sizeof(crc));
-        write(tmp_fd, payload.c_str(), len);
+        if (!write_fully(tmp_fd, &len, sizeof(len)) ||
+            !write_fully(tmp_fd, &crc, sizeof(crc)) ||
+            !write_fully(tmp_fd, payload.c_str(), len)) {
+            close(tmp_fd);
+            unlink(tmp_filepath.c_str());
+            return;
+        }
     }
     
-    fdatasync(tmp_fd);
+    if (fdatasync(tmp_fd) < 0) {
+        close(tmp_fd);
+        unlink(tmp_filepath.c_str());
+        return;
+    }
     close(tmp_fd);
-    rename(tmp_filepath.c_str(), filepath.c_str());
-    
-    close(fd);
-    fd = open(filepath.c_str(), O_CREAT | O_RDWR | O_APPEND, 0644);
-    std::cout << "[WAL] Compaction complete. Rewrote " << snapshot.size() << " active keys.\n";
+
+    if (rename(tmp_filepath.c_str(), filepath.c_str()) == 0) {
+        close(fd);
+        fd = open(filepath.c_str(), O_CREAT | O_RDWR | O_APPEND, 0644);
+    }
 }

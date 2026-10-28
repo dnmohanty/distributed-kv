@@ -26,13 +26,14 @@ private:
 
     uint32_t calculate_crc32(const std::string& data);
     void background_flush();
+    bool write_fully(int file_fd, const void* buf, size_t count);
 
 public:
     WAL(const std::string& filepath, FsyncMode mode = FsyncMode::ALWAYS);
     ~WAL();
 
-    void append(const std::string& key, const std::string& value, int ttl = 0);
-    void append_del(const std::string& key);
+    bool append(const std::string& key, const std::string& value, uint64_t expiry);
+    bool append_del(const std::string& key);
     
     void recover(Store& store);
     void compact(Store& store);

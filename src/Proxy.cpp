@@ -12,6 +12,7 @@
 #include <thread>
 #include <chrono>
 #include <netdb.h>
+#include <mutex>
 
 Proxy::Proxy(int port, const std::vector<std::string>& cluster_nodes) : port(port), nodes(cluster_nodes), stop_health_checks(false) {
     for (const auto& node : cluster_nodes) {
@@ -35,13 +36,8 @@ Proxy::Proxy(int port, const std::vector<std::string>& cluster_nodes) : port(por
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port);
 
-    if (bind(proxy_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        throw std::runtime_error("Failed to bind to port");
-    }
-
-    if (listen(proxy_fd, SOMAXCONN) < 0) {
-        throw std::runtime_error("Failed to listen on socket");
-    }
+    if (bind(proxy_fd, (struct sockaddr*)&address, sizeof(address)) < 0) throw std::runtime_error("Failed to bind");
+    if (listen(proxy_fd, SOMAXCONN) < 0) throw std::runtime_error("Failed to listen");
 
     set_non_blocking(proxy_fd);
     health_check_thread = std::thread(&Proxy::health_check_loop, this);
@@ -50,10 +46,7 @@ Proxy::Proxy(int port, const std::vector<std::string>& cluster_nodes) : port(por
 Proxy::~Proxy() {
     stop_health_checks = true;
     if (health_check_thread.joinable()) health_check_thread.join();
-
-    for (auto const& [node, fd] : node_to_fd) {
-        close(fd);
-    }
+    for (auto const& [node, fd] : node_to_fd) close(fd);
     close(proxy_fd);
     close(epoll_fd);
 }
@@ -64,9 +57,7 @@ void Proxy::set_non_blocking(int socket_fd) {
 }
 
 void Proxy::init_backend_connections() {
-    for (const auto& node : nodes) {
-        connect_to_node(node);
-    }
+    for (const auto& node : nodes) connect_to_node(node);
 }
 
 void Proxy::connect_to_node(const std::string& node) {
@@ -111,9 +102,7 @@ void Proxy::health_check_loop() {
             int fd = -1;
             {
                 std::shared_lock<std::shared_mutex> lock(state_mtx);
-                if (node_to_fd.find(node) != node_to_fd.end()) {
-                    fd = node_to_fd[node];
-                }
+                if (node_to_fd.find(node) != node_to_fd.end()) fd = node_to_fd[node];
             }
             
             bool is_healthy = false;
@@ -131,10 +120,8 @@ void Proxy::health_check_loop() {
             if (is_healthy != node_status[node]) {
                 node_status[node] = is_healthy;
                 if (is_healthy) {
-                    std::cout << "[Proxy] Node " << node << " recovered.\n";
                     hash_ring.add_node(node);
                 } else {
-                    std::cout << "[Proxy] Node " << node << " DOWN. Evicting from ring.\n";
                     hash_ring.remove_node(node);
                     if (fd != -1) {
                         close(fd);
@@ -154,8 +141,6 @@ void Proxy::start() {
 
     const int MAX_EVENTS = 64;
     epoll_event events[MAX_EVENTS];
-
-    std::cout << "Smart Proxy Gateway listening on port " << port << "...\n";
 
     while (true) {
         int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
@@ -206,6 +191,12 @@ void Proxy::handle_client_data(int client_fd) {
         ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
         if (bytes_read > 0) {
             client_buffers[client_fd].append(buffer, bytes_read);
+            if (client_buffers[client_fd].size() > 1048576) {
+                close(client_fd);
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                client_buffers.erase(client_fd);
+                return;
+            }
         } else if (bytes_read == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             close(client_fd);
@@ -246,7 +237,7 @@ void Proxy::handle_client_data(int client_fd) {
 
         if (key.empty()) {
             std::string err = "ERROR: Missing key\n";
-            write(client_fd, err.c_str(), err.length());
+            send(client_fd, err.c_str(), err.length(), MSG_NOSIGNAL);
         } else {
             std::string owner;
             int backend_fd = -1;
@@ -260,10 +251,10 @@ void Proxy::handle_client_data(int client_fd) {
 
             if (backend_fd == -1) {
                 std::string err = "ERROR: No backend nodes available\n";
-                write(client_fd, err.c_str(), err.length());
+                send(client_fd, err.c_str(), err.length(), MSG_NOSIGNAL);
             } else {
                 backend_pending_clients[backend_fd].push(client_fd);
-                write(backend_fd, full_request.c_str(), full_request.length());
+                send(backend_fd, full_request.c_str(), full_request.length(), MSG_NOSIGNAL);
             }
         }
     }
@@ -292,7 +283,7 @@ void Proxy::handle_backend_data(int backend_fd) {
         if (!backend_pending_clients[backend_fd].empty()) {
             int client_fd = backend_pending_clients[backend_fd].front();
             backend_pending_clients[backend_fd].pop();
-            write(client_fd, response.c_str(), response.length());
+            send(client_fd, response.c_str(), response.length(), MSG_NOSIGNAL);
         }
     }
 }
