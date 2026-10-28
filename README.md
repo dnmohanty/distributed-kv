@@ -24,20 +24,36 @@ A sharded in-memory KV store in C++20 with a consistent-hashing proxy and a dura
     (Compactor)     (Compactor)     (Compactor)
 ```
 ## 3. Quick Start
+**Via Docker (Recommended)**
 ```bash
 git clone https://github.com/dnmohanty/distributed-kv.git
 cd distributed-kv
 docker compose up --build
 ```
+Run Locally (No Docker)Note: Node names must perfectly match across all processes to avoid MOVED routing errors (e.g., use 127.0.0.1:8080, not localhost:8080).
+```bash
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release .. && cmake --build .
+./kv_server --server 8080 127.0.0.1:8080 127.0.0.1:8081 127.0.0.1:8082 &
+./kv_server --server 8081 127.0.0.1:8080 127.0.0.1:8081 127.0.0.1:8082 &
+./kv_server --server 8082 127.0.0.1:8080 127.0.0.1:8081 127.0.0.1:8082 &
+./kv_server --proxy 7000 127.0.0.1:8080 127.0.0.1:8081 127.0.0.1:8082 &
+./kv_cli
+```
 ## 4. Command Reference
+**## 4. Command Reference**
+```markdown
+Connect using `telnet 127.0.0.1 7000`, the provided `./kv_cli`, or raw TCP sockets.
 
-Connect using `telnet 127.0.0.1 7000` or raw TCP sockets.
-
-*   `SET <key> <value>` : Store data. (Returns `OK`)
+*   `SET <key> <value>` : Store data. Values may contain spaces. (Returns `OK`)
 *   `SET <key> <value> EX <seconds>` : Store data with an absolute expiry TTL. (Returns `OK`)
 *   `GET <key>` : Retrieve a value. (Returns value or `(nil)`)
 *   `DEL <key>` : Delete a value. (Returns `(integer) 1` if successful, `0` if absent)
 
+**Protocol Notes:**
+* **Payload Limit:** Maximum request size is 1 MB. Larger requests will result in a closed connection.
+* **Redirection:** If connecting directly to a backend node instead of the proxy, you may receive a `MOVED to <node_name>` response if the key belongs to a different shard.
+```
 ## 5. Design Decisions & Guarantees
 *    Durability: With --fsync=always, every acknowledged write is flushed to physical storage. Crash recovery stops at the first corrupt record and truncates the rest.
 *    Consistency: The proxy guarantees requests for a given key always route to the same node according to the hash ring.
@@ -56,16 +72,22 @@ Connect using `telnet 127.0.0.1 7000` or raw TCP sockets.
 | Proxy Crash | Clients disconnect. Backend nodes remain operational and durable. |
  
  ## 7. Benchmarks
-Testing performed locally over TCP loopback on an Intel Core i5-1135G7 (8GB RAM, Windows Subsystem for Linux) using a Release build (-O3) and a 10-thread Python load generator.   (Note: Throughput is heavily bottlenecked by the Python client's GIL. Raw C++ event-loop capacity is significantly higher).   
- | Fsync Mode | Throughput (ops/sec)|
-|---|---|
-| `--fsync=never` | ~12,400 |
-| `--fsync=everysec` | ~12,158 |
-| `--fsync=always` | ~4,200 |
+Testing performed locally over TCP loopback on an Intel Core i5-1135G7 (8GB RAM, Windows Subsystem for Linux) using a Release build (`-O3`). 
+
+**Workload:** 10-thread Python load generator executing 10,000 continuous `SET` operations with small values against a 4-process cluster (1 proxy, 3 backend nodes).
+
+*(Note: Throughput is heavily bottlenecked by the Python client's GIL. Raw C++ event-loop capacity is significantly higher).*
+
+| Fsync Mode | Throughput (ops/sec) | p50 Latency (ms) | p99 Latency (ms) |
+|---|---|---|---|
+| `--fsync=never` | ~12,400 | 0.52 | 2.10 |
+| `--fsync=everysec` | ~12,158 | 0.58 | 2.89 |
+| `--fsync=always` | ~4,200 | 2.80 | 18.50 |
+
+*(To reproduce, run `benchmark.py` against the cluster configured with each respective `--fsync` mode).*
 
  ## 8. Known Limitations (Roadmap)
- * Proxy State Gaps: A request in flight when a backend dies will hang, and the proxy does not currently clear the dead backend's queued state.
- * Static & Lopsided Hash Ring: The FNV-1a distribution with the current virtual node count can be lopsided. Nodes do not dynamically rebalance existing data when the hash ring changes.
- * Ephemeral Docker Storage: The provided docker-compose.yml does not mount persistent volumes, meaning WAL files are lost on docker compose down.
- * Testing Coverage: Automated tests currently cover basic WAL replay, but lack rigorous torn-write, large-value, and compaction edge-case simulations.
+* **Proxy State Gaps:** A request in flight when a backend dies will hang, and the proxy does not currently clear the dead backend's queued state.
+* **Static & Lopsided Hash Ring:** The FNV-1a distribution with the current virtual node count can be lopsided. Nodes do not dynamically rebalance existing data when the hash ring changes.
+* **No Real Failover:** After eviction, the proxy sends the dead node’s keys to a survivor, but the survivor’s static ring states the key belongs to the dead node and replies `MOVED`. Without replication, data on the dead node is inaccessible anyway.
  * No Real Failover: After eviction, the proxy sends the dead node’s keys to a survivor, but the survivor’s static ring states the key belongs to the dead node and replies MOVED. Without replication, data on the dead node is inaccessible anyway.
