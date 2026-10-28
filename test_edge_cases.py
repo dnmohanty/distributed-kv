@@ -22,11 +22,10 @@ large_val = "A" * (1024 * 1024 + 10)
 try:
     send_req(f"SET huge_key {large_val}")
 except ConnectionResetError:
-    pass # Proxy correctly dropped the connection
+    pass
 print("Large value rejection passed.")
 
 print("3. Testing Torn-Write Recovery...")
-# Simulate a torn write by appending garbage to a backend WAL
 with open("data/node1/node_8080.wal", "ab") as f:
     f.write(b"GARBAGE_TORN_WRITE_BYTES")
 print("Torn-write injected. Restart the server to verify it recovers previous keys cleanly and truncates the garbage.")
