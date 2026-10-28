@@ -118,6 +118,5 @@ To reproduce, run `benchmark.py` against a cluster started with each `--fsync` m
 * **Proxy state gaps:** A request in flight when a backend dies will hang, and the proxy does not clear that backend's queued state.
 * **Static, lopsided hash ring:** FNV-1a with the current number of virtual nodes can distribute keys unevenly. Nodes do not rebalance or migrate data when ring membership changes.
 * **No real failover:** After a node is evicted, the proxy sends its keys to a surviving node, but that node's static ring says the key belongs to the dead node and replies `MOVED`. Without replication, the dead node's data is unavailable until it restarts.
-* **Ephemeral Docker storage:** `docker-compose.yml` does not mount volumes, so WAL files are lost on `docker compose down`.
 * **Testing coverage:** Automated tests cover basic crash recovery. Torn-write, large-value and compaction cases are not yet automated.
 * **Single-threaded request handling:** One epoll thread serves all requests, so the 16 shards do not yet give parallel request handling.
