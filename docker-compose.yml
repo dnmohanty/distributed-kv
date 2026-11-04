@@ -2,7 +2,7 @@ version: '3.8'
 services:
   proxy:
     build: .
-    command: ./kv_server --proxy 7000 node1:8080 node2:8081 node3:8082
+    command: ./kv_server proxy 7000 node1:8080 node2:8081 node3:8082
     ports:
       - "7000:7000"
     depends_on:
@@ -12,18 +12,27 @@ services:
 
   node1:
     build: .
-    command: ./kv_server --server 8080 node1:8080 node2:8081 node3:8082
+    working_dir: /app/data
+    command: /app/build/kv_server 8080 node1:8080 node2:8081 node3:8082
+    ports:
+      - "8080:8080"
     volumes:
-      - ./data/node1:/app/build
+      - ./data/node1:/app/data
 
   node2:
     build: .
-    command: ./kv_server --server 8081 node1:8080 node2:8081 node3:8082
+    working_dir: /app/data
+    command: /app/build/kv_server 8081 node1:8080 node2:8081 node3:8082
+    ports:
+      - "8081:8081"
     volumes:
-      - ./data/node2:/app/build
+      - ./data/node2:/app/data
 
   node3:
     build: .
-    command: ./kv_server --server 8082 node1:8080 node2:8081 node3:8082
+    working_dir: /app/data
+    command: /app/build/kv_server 8082 node1:8080 node2:8081 node3:8082
+    ports:
+      - "8082:8082"
     volumes:
-      - ./data/node3:/app/build
+      - ./data/node3:/app/data
