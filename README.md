@@ -25,6 +25,7 @@ A sharded in-memory key-value store in C++20 with a consistent-hashing proxy and
       (WAL)           (WAL)           (WAL)
     (Compactor)     (Compactor)     (Compactor)
 ```
+![Uploading Screen Recording 2026-11-06 045248.gif…]()
 
 ## 3. Quick Start
 
