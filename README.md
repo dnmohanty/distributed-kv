@@ -1,7 +1,7 @@
 # DistributedKV
 
 A sharded in-memory key-value store in C++20 with a consistent-hashing proxy and a durable write-ahead log.
-![Uploading Screen Recording 2026-11-06 045248.gif…]()
+<img width="400" height="213" alt="Screen Recording 2026-11-06 045248" src="https://github.com/user-attachments/assets/5ff501f7-7916-4d71-848f-54b8aa884a94" />
 
 ## 1. Features
 
