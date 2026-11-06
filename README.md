@@ -2,7 +2,8 @@
 
 A sharded in-memory key-value store in C++20 with a consistent-hashing proxy and a durable write-ahead log. Each shard is a single process; there is no replication.
 
-![Crash recovery demo](docs/recovery.gif)
+<img width="1100" height="658" alt="kv_recovery" src="https://github.com/user-attachments/assets/dbd8af66-5022-496e-a104-8be2d6388a23" />
+
 
 *The demo: write two keys through the proxy, `kill -9` the node that owns one of them, read the key (the proxy answers `MOVED` while the node is down), restart the node, and read both keys back from its write-ahead log.*
 
