@@ -73,13 +73,12 @@ Connect with `telnet 127.0.0.1 7000`, the provided `./kv_cli`, or any raw TCP cl
 - `SET <key> <value> EX <seconds>`: Store data that expires after `<seconds>` seconds. Returns `OK`.
 - `GET <key>`: Returns the value, or `(nil)` if the key is missing or expired.
 - `DEL <key>`: Returns `(integer) 1` if the key existed, `(integer) 0` otherwise.
-- `PING`: Returns `PONG`.
 
 **Protocol notes**
 
-- **Limits:** A key is a non-empty token without spaces, up to 1,024 bytes. A value cannot be empty or contain a newline. The maximum request size is 1 MB; a connection that buffers more than that is closed without a reply.
-- **TTL:** If a `SET` value ends with ` EX <digits>`, that suffix is parsed as the TTL and is not part of the value. TTLs must be between 1 second and about 10 years, with one-second resolution.
-- **Errors:** `ERROR: Missing key or value`, `ERROR: Missing key`, `ERROR: Invalid TTL` (zero, negative, too large or non-numeric), `ERROR: Key too long`, `ERROR: Unknown command`, `ERROR: Disk write failed`, and, from the proxy only, `ERROR: No backend nodes available`.
+- **Limits:** A key is a non-empty token without spaces. A value cannot be empty or contain a newline. The maximum request size is 1 MB; a connection that buffers more than that is closed without a reply.
+- **TTL:** TTLs must be a positive integer number of seconds.
+- **Errors:** `ERROR: Missing key or value`, `ERROR: Missing key`, `ERROR: Invalid TTL` (zero, negative, too large or non-numeric), `ERROR: Unknown command`, `ERROR: Disk write failed`, and, from the proxy only, `ERROR: No backend nodes available`.
 - **Redirection:** A backend replies `MOVED to <node>` when the key belongs to a different node. You see this when connecting to a backend directly, or through the proxy while a node is evicted.
 
 ## 5. Design decisions and guarantees
