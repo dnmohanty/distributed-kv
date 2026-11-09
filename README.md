@@ -1,4 +1,4 @@
-# DistributedKV
+# ShardedKV
 
 A sharded in-memory key-value store in C++20 with a consistent-hashing proxy and a durable write-ahead log. Each shard is a single process; there is no replication.
 
